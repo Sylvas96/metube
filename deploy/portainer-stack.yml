@@ -1,0 +1,73 @@
+# Pile Portainer "metube" — Stacks > Add stack > Web editor.
+# Prérequis sur le serveur Docker : le fichier
+#   /docker/metube/gateway/default.conf.template
+# (copie de deploy/gateway/default.conf.template de ce dépôt).
+# Variables de pile obligatoires (Portainer > Environment variables) :
+#   AUTHELIA_URL   adresse interne d'Authelia, ex. http://192.168.x.x:9091
+#   METUBE_IP      adresse de la passerelle sur le réseau macvlan
+#   ADMIN_USER     compte qui gère abonnements et cookies
+#   METUBE_IMAGE   image construite par le fork, ex. ghcr.io/<compte>/metube:multi-user
+
+services:
+  # Seul conteneur joignable depuis le réseau : authentifie via Authelia.
+  gateway:
+    image: nginx:stable-alpine
+    container_name: metube-gateway
+    restart: unless-stopped
+    environment:
+      TZ: America/Toronto
+      AUTHELIA_URL: "${AUTHELIA_URL}"
+    volumes:
+      - /docker/metube/gateway/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    networks:
+      docker-lan:
+        ipv4_address: "${METUBE_IP}"
+        priority: 1000
+      backend: {}
+
+  # MeTube multi-utilisateur : jamais exposé directement.
+  metube:
+    image: "${METUBE_IMAGE}"
+    container_name: metube
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      UMASK: "077"
+      TZ: America/Toronto
+      AUTH_USER_HEADER: Remote-User
+      ADMIN_USER: "${ADMIN_USER}"
+      MAX_CONCURRENT_DOWNLOADS: "${MAX_CONCURRENT_DOWNLOADS:-3}"     # par utilisateur
+      CLEAR_COMPLETED_AFTER: "${CLEAR_COMPLETED_AFTER:-86400}"       # 24 h
+      DELETE_FILE_ON_TRASHCAN: "true"
+      CUSTOM_DIRS: "false"
+    volumes:
+      - /docker/metube/downloads:/downloads
+    networks:
+      - backend
+
+  # Filet de sécurité : supprime les fichiers plus vieux que RETENTION_HOURS,
+  # y compris après un redémarrage de MeTube.
+  cleanup:
+    image: alpine:3
+    container_name: metube-cleanup
+    restart: unless-stopped
+    network_mode: none
+    environment:
+      RETENTION_HOURS: "${RETENTION_HOURS:-25}"
+    volumes:
+      - /docker/metube/downloads:/data
+    command:
+      - sh
+      - -c
+      - >
+        while true; do
+        find /data -mindepth 2 -type f -not -path '/data/.metube/*'
+        -cmin +$$((RETENTION_HOURS * 60)) -print -delete;
+        sleep 900; done
+
+networks:
+  docker-lan:
+    external: true
+  backend:
+    driver: bridge

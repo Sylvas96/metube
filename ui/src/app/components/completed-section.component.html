@@ -115,7 +115,7 @@
                   <button type="button" class="btn btn-link" [attr.aria-label]="'Retry download for ' + entry[1].title" (click)="retryDownload(entry[0], entry[1])"><fa-icon [icon]="faRedoAlt" /></button>
                 }
                 @if (entry[1].filename) {
-                  <a href="{{buildDownloadLink(entry[1])}}" download class="btn btn-link" [attr.aria-label]="'Download result file for ' + entry[1].title"><fa-icon [icon]="faDownload" /></a>
+                  <a href="{{buildDownloadLink(entry[1])}}" download class="btn btn-sm btn-success text-nowrap align-self-center me-1" [attr.aria-label]="'Download result file for ' + entry[1].title"><fa-icon [icon]="faDownload" />&nbsp;Télécharger sur mon PC</a>
                 }
                 @if (entry[1].filename && canShareDownloads()) {
                   <button type="button" class="btn btn-link" [attr.aria-label]="'Share result file for ' + entry[1].title" (click)="shareDownload(entry[1])"><fa-icon [icon]="faShareNodes" /></button>

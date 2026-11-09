@@ -16,12 +16,12 @@ import json
 import pathlib
 import re
 import time
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 from watchfiles import awatch
 
 import bg_tasks
 import format_catalog
-from ytdl import DownloadQueueNotifier, DownloadQueue, Download
+from ytdl import DownloadQueueNotifier, DownloadQueue, Download, _is_within_directory
 from download_options import DownloadOptions
 from subscriptions import SubscriptionManager, SubscriptionNotifier, SubscriptionInfo, browse_playlist, coerce_optional_bool
 from yt_dlp.version import __version__ as yt_dlp_version
@@ -111,6 +111,8 @@ class Config:
         'LOGLEVEL': 'INFO',
         'ENABLE_ACCESSLOG': 'false',
         'YTDL_NIGHTLY_UPDATE_TIME': '',
+        'AUTH_USER_HEADER': '',
+        'ADMIN_USER': '',
     }
 
     _BOOLEAN = ('DOWNLOAD_DIRS_INDEXABLE', 'CUSTOM_DIRS', 'CREATE_CUSTOM_DIRS', 'HTTPS', 'ENABLE_ACCESSLOG', 'ALLOW_YTDL_OPTIONS_OVERRIDES', 'ALLOW_PRIVATE_ADDRESSES')
@@ -532,7 +534,80 @@ def _socketio_origin_allowed(origin, environ):
     return False
 
 
-app = web.Application(middlewares=[cross_origin_guard, state_dir_guard])
+# --- Multi-user mode ---------------------------------------------------------
+# With AUTH_USER_HEADER set, MeTube trusts that header (set by an authenticating
+# reverse proxy, e.g. Authelia's Remote-User) to tell users apart. Each user
+# gets a private DownloadQueue with its own download, temp and state
+# directories, receives only its own Socket.IO events, and can only fetch files
+# from its own directory. Unset (the default), nothing here is active.
+#
+# The header is only as trustworthy as the network path: MeTube must then be
+# reachable solely through the proxy, which must overwrite the header.
+_AUTH_HEADER = config.AUTH_USER_HEADER.strip()
+MULTI_USER = bool(_AUTH_HEADER)
+_AUTH_ENVIRON_KEY = 'HTTP_' + _AUTH_HEADER.upper().replace('-', '_')
+_USER_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]{0,63}$')
+
+
+def _normalize_user(raw):
+    """The account name as a safe directory name, or None when unusable."""
+    user = (raw or '').strip().lower()
+    if not _USER_RE.match(user) or '..' in user:
+        return None
+    return user
+
+
+ADMIN_USER = _normalize_user(config.ADMIN_USER) or ''
+if config.ADMIN_USER.strip() and not ADMIN_USER:
+    log.error('Environment variable "ADMIN_USER" is not a valid account name')
+    sys.exit(1)
+
+
+def _user_room(user: str) -> str:
+    return f'user:{user}'
+
+
+class UserConfig:
+    """The global config as seen by one user: same settings, private directories."""
+
+    _DIR_KEYS = ('DOWNLOAD_DIR', 'AUDIO_DOWNLOAD_DIR', 'TEMP_DIR')
+
+    def __init__(self, base, user: str):
+        overrides = {k: os.path.join(getattr(base, k), user) for k in self._DIR_KEYS}
+        overrides['STATE_DIR'] = os.path.join(base.STATE_DIR, 'users', user)
+        object.__setattr__(self, '_base', base)
+        object.__setattr__(self, '_overrides', overrides)
+        object.__setattr__(self, 'user', user)
+        for path in overrides.values():
+            os.makedirs(path, exist_ok=True)
+
+    def __getattr__(self, name):
+        overrides = object.__getattribute__(self, '_overrides')
+        if name in overrides:
+            return overrides[name]
+        return getattr(object.__getattribute__(self, '_base'), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, '_base'), name, value)
+
+
+@web.middleware
+async def auth_user_guard(request, handler):
+    if MULTI_USER:
+        user = _normalize_user(request.headers.get(_AUTH_HEADER))
+        if user is None:
+            raise web.HTTPUnauthorized(text='Authentication required.')
+        request['metube_user'] = user
+    return await handler(request)
+
+
+def _require_admin(request):
+    """Instance-wide features (subscriptions, cookies) belong to ADMIN_USER."""
+    if MULTI_USER and (not ADMIN_USER or request.get('metube_user') != ADMIN_USER):
+        raise web.HTTPForbidden(text='Reserved to the administrator account.')
+
+
+app = web.Application(middlewares=[cross_origin_guard, auth_user_guard, state_dir_guard])
 _cors_origins = [o.strip() for o in config.CORS_ALLOWED_ORIGINS.split(',') if o.strip()] if config.CORS_ALLOWED_ORIGINS else []
 if '*' in _cors_origins and len(_cors_origins) > 1:
     log.warning(
@@ -760,35 +835,91 @@ def _migrate_legacy_request(post: dict) -> dict:
     return post
 
 class Notifier(DownloadQueueNotifier):
+    def __init__(self, room=None):
+        # None broadcasts to every client (single-user mode).
+        self.room = room
+
     async def added(self, dl):
         log.info(f"Notifier: Download added - {dl.title}")
-        await sio.emit('added', serializer.encode(dl))
+        await sio.emit('added', serializer.encode(dl), to=self.room)
 
     async def updated(self, dl):
         log.debug(f"Notifier: Download updated - {dl.title}")
-        await sio.emit('updated', serializer.encode(dl))
+        await sio.emit('updated', serializer.encode(dl), to=self.room)
 
     async def completed(self, dl):
         log.info(f"Notifier: Download completed - {dl.title}")
-        await sio.emit('completed', serializer.encode(dl))
+        await sio.emit('completed', serializer.encode(dl), to=self.room)
 
     async def canceled(self, id):
         log.info(f"Notifier: Download canceled - {id}")
-        await sio.emit('canceled', serializer.encode(id))
+        await sio.emit('canceled', serializer.encode(id), to=self.room)
 
     async def cleared(self, id):
         log.info(f"Notifier: Download cleared - {id}")
-        await sio.emit('cleared', serializer.encode(id))
+        await sio.emit('cleared', serializer.encode(id), to=self.room)
 
-dqueue = DownloadQueue(config, Notifier())
+# The default queue. Single-user mode: the only one. Multi-user mode: the
+# administrator's, which is also the one subscriptions feed; without an
+# ADMIN_USER it stays unused and its events go to a room nobody joins.
+if MULTI_USER:
+    _default_config = UserConfig(config, ADMIN_USER) if ADMIN_USER else config
+    _default_room = _user_room(ADMIN_USER) if ADMIN_USER else 'nobody'
+else:
+    _default_config = config
+    _default_room = None
+
+dqueue = DownloadQueue(_default_config, Notifier(_default_room))
+
+_user_queues: dict[str, DownloadQueue] = {}
+_user_queues_lock = asyncio.Lock()
+
+
+async def _get_user_queue(user: str) -> DownloadQueue:
+    """The private queue of *user*, created (and restored from disk) on first use."""
+    if user == ADMIN_USER:
+        return dqueue
+    queue = _user_queues.get(user)
+    if queue is None:
+        async with _user_queues_lock:
+            queue = _user_queues.get(user)
+            if queue is None:
+                queue = DownloadQueue(UserConfig(config, user), Notifier(_user_room(user)))
+                await queue.initialize()
+                _user_queues[user] = queue
+                log.info('Created download queue for user %s', user)
+    return queue
+
+
+async def _queue_for(request) -> DownloadQueue:
+    if not MULTI_USER:
+        return dqueue
+    return await _get_user_queue(request['metube_user'])
+
+
+def _config_for_user(user):
+    if not MULTI_USER or user is None:
+        return config
+    if user == ADMIN_USER:
+        return _default_config
+    return UserConfig(config, user)
 
 
 async def _download_queue_startup(app):
     await dqueue.initialize()
+    if MULTI_USER:
+        # Resume the downloads users had queued before the restart.
+        users_dir = os.path.join(config.STATE_DIR, 'users')
+        if os.path.isdir(users_dir):
+            for name in sorted(os.listdir(users_dir)):
+                if _normalize_user(name) == name and name != ADMIN_USER:
+                    await _get_user_queue(name)
 
 
 async def _shutdown_download_manager(app):
     dqueue.close()
+    for queue in _user_queues.values():
+        queue.close()
     Download.shutdown_manager()
 
 
@@ -799,20 +930,20 @@ app.on_cleanup.append(_shutdown_download_manager)
 class MetubeSubscriptionNotifier(SubscriptionNotifier):
     async def subscription_added(self, sub: SubscriptionInfo):
         log.info("Subscription added: %s", sub.name)
-        await sio.emit('subscription_added', serializer.encode(sub.to_public_dict()))
+        await sio.emit('subscription_added', serializer.encode(sub.to_public_dict()), to=_default_room)
 
     async def subscription_updated(self, sub: SubscriptionInfo):
-        await sio.emit('subscription_updated', serializer.encode(sub.to_public_dict()))
+        await sio.emit('subscription_updated', serializer.encode(sub.to_public_dict()), to=_default_room)
 
     async def subscription_removed(self, sub_id: str):
         log.info("Subscription removed: %s", sub_id)
-        await sio.emit('subscription_removed', serializer.encode(sub_id))
+        await sio.emit('subscription_removed', serializer.encode(sub_id), to=_default_room)
 
     async def subscriptions_all(self, subs: list[SubscriptionInfo]):
-        await sio.emit('subscriptions_all', serializer.encode([s.to_public_dict() for s in subs]))
+        await sio.emit('subscriptions_all', serializer.encode([s.to_public_dict() for s in subs]), to=_default_room)
 
 
-submgr = SubscriptionManager(config, dqueue, MetubeSubscriptionNotifier())
+submgr = SubscriptionManager(_default_config, dqueue, MetubeSubscriptionNotifier())
 
 
 async def _shutdown_subscriptions(app):
@@ -1095,7 +1226,7 @@ async def add(request):
         bool(options.folder),
         options.auto_start,
     )
-    status = await dqueue.add(url, options)
+    status = await (await _queue_for(request)).add(url, options)
     return web.Response(text=serializer.encode(status))
 
 
@@ -1137,7 +1268,7 @@ async def presets(request):
 
 @routes.post(config.URL_PREFIX + 'cancel-add')
 async def cancel_add(request):
-    dqueue.cancel_add()
+    (await _queue_for(request)).cancel_add()
     return web.Response(text=serializer.encode({'status': 'ok'}), content_type='application/json')
 
 
@@ -1148,12 +1279,13 @@ async def retry(request):
     # record only once it is confirmed re-queued. A batch form would have to
     # report per-id results for the caller to know which ones to remove.
     post = await _read_json_request(request)
-    status = await dqueue.retry(_require_id(post))
+    status = await (await _queue_for(request)).retry(_require_id(post))
     return web.Response(text=serializer.encode(status), content_type='application/json')
 
 
 @routes.post(config.URL_PREFIX + 'subscribe')
 async def subscribe(request):
+    _require_admin(request)
     post = await _read_json_request(request)
     url, options = parse_download_options(post)
     cic = post.get('check_interval_minutes')
@@ -1209,11 +1341,14 @@ async def subscribe(request):
 
 @routes.get(config.URL_PREFIX + 'subscriptions')
 async def subscriptions_list(request):
+    if MULTI_USER and request.get('metube_user') != ADMIN_USER:
+        return web.Response(text=serializer.encode([]))
     return web.Response(text=serializer.encode([s.to_public_dict() for s in submgr.list_all()]))
 
 
 @routes.post(config.URL_PREFIX + 'subscriptions/update')
 async def subscriptions_update(request):
+    _require_admin(request)
     post = await _read_json_request(request)
     sub_id = post.get('id')
     if not sub_id:
@@ -1233,6 +1368,7 @@ async def subscriptions_update(request):
 
 @routes.post(config.URL_PREFIX + 'subscriptions/delete')
 async def subscriptions_delete(request):
+    _require_admin(request)
     post = await _read_json_request(request)
     ids = post.get('ids')
     if not ids or not isinstance(ids, list):
@@ -1243,6 +1379,7 @@ async def subscriptions_delete(request):
 
 @routes.post(config.URL_PREFIX + 'subscriptions/check')
 async def subscriptions_check(request):
+    _require_admin(request)
     post = await _read_json_request(request)
     ids = post.get('ids')
     if ids is not None and not isinstance(ids, list):
@@ -1276,7 +1413,8 @@ async def delete(request):
     delete_files = post.get('delete_files', False)
     if not isinstance(delete_files, bool):
         raise web.HTTPBadRequest(reason="'delete_files' must be a boolean")
-    status = await (dqueue.cancel(ids) if where == 'queue' else dqueue.clear(ids, delete_files=delete_files))
+    queue = await _queue_for(request)
+    status = await (queue.cancel(ids) if where == 'queue' else queue.clear(ids, delete_files=delete_files))
     log.info(f"Download delete request processed for ids: {ids}, where: {where}")
     return web.Response(text=serializer.encode(status))
 
@@ -1285,7 +1423,7 @@ async def start(request):
     post = await _read_json_request(request)
     ids = _require_id_list(post)
     log.info(f"Received request to start pending downloads for ids: {ids}")
-    status = await dqueue.start_pending(ids)
+    status = await (await _queue_for(request)).start_pending(ids)
     return web.Response(text=serializer.encode(status))
 
 
@@ -1317,6 +1455,7 @@ def warn_if_cookiefile_shadowed():
 
 @routes.post(config.URL_PREFIX + 'upload-cookies')
 async def upload_cookies(request):
+    _require_admin(request)
     reader = await request.multipart()
     field = await reader.next()
     if field is None or field.name != 'cookies':
@@ -1351,6 +1490,7 @@ async def upload_cookies(request):
 
 @routes.post(config.URL_PREFIX + 'delete-cookies')
 async def delete_cookies(request):
+    _require_admin(request)
     has_uploaded_cookies = os.path.exists(COOKIES_PATH)
     configured_cookiefile = config.YTDL_OPTIONS.get('cookiefile')
     has_manual_cookiefile = isinstance(configured_cookiefile, str) and configured_cookiefile and configured_cookiefile != COOKIES_PATH
@@ -1391,17 +1531,18 @@ async def history(request):
     # Served from the in-memory queues (like the socket 'all' event) rather
     # than saved_items(), which reloads and re-compacts the on-disk state on
     # every call.
-    for _, v in dqueue.queue.items():
+    queue = await _queue_for(request)
+    for _, v in queue.queue.items():
         history['queue'].append(v.info)
-    for _, v in dqueue.done.items():
+    for _, v in queue.done.items():
         history['done'].append(v.info)
-    for _, v in dqueue.pending.items():
+    for _, v in queue.pending.items():
         history['pending'].append(v.info)
 
     log.info("Sending download history")
     return web.Response(text=serializer.encode(history))
 
-async def _emit_connect_finish(sid):
+async def _emit_connect_finish(sid, user=None):
     """Slow connect-finish events, dispatched off the connect-ACK path.
 
     The socket.io connect ACK is sent only after the ``connect`` handler
@@ -1415,7 +1556,7 @@ async def _emit_connect_finish(sid):
     """
     loop = asyncio.get_running_loop()
     if config.CUSTOM_DIRS:
-        dirs = await loop.run_in_executor(None, get_custom_dirs)
+        dirs = await loop.run_in_executor(None, get_custom_dirs, _config_for_user(user))
         await sio.emit('custom_dirs', serializer.encode(dirs), to=sid)
     if config.YTDL_OPTIONS_FILE:
         options_update = await loop.run_in_executor(None, get_options_update_time)
@@ -1432,8 +1573,27 @@ async def connect(sid, environ):
     # handshake -- ``_save_dict_async`` serializes on the loop for the same
     # reason. 'all' goes out first: the UI populates its state from it before
     # the finer-grained events that may follow.
-    await sio.emit('all', serializer.encode(dqueue.get()), to=sid)
-    await sio.emit('subscriptions_all', serializer.encode([s.to_public_dict() for s in submgr.list_all()]), to=sid)
+    user = None
+    queue = dqueue
+    subscriptions = submgr.list_all()
+    if MULTI_USER:
+        # The user comes from the proxy's header on the handshake request; a
+        # connection without it is refused, and the socket only ever joins
+        # that user's room, so it receives nobody else's events.
+        aiohttp_request = environ.get('aiohttp.request')
+        raw_user = (aiohttp_request.headers.get(_AUTH_HEADER) if aiohttp_request is not None
+                    else environ.get(_AUTH_ENVIRON_KEY))
+        user = _normalize_user(raw_user)
+        if user is None:
+            raise socketio.exceptions.ConnectionRefusedError('authentication required')
+        entered = sio.enter_room(sid, _user_room(user))
+        if asyncio.iscoroutine(entered):
+            await entered
+        queue = await _get_user_queue(user)
+        if user != ADMIN_USER:
+            subscriptions = []
+    await sio.emit('all', serializer.encode(queue.get()), to=sid)
+    await sio.emit('subscriptions_all', serializer.encode([s.to_public_dict() for s in subscriptions]), to=sid)
     await sio.emit('formats', serializer.encode(format_catalog.public_catalog()), to=sid)
     await sio.emit('configuration', serializer.encode(config.frontend_safe()), to=sid)
     # The slow directory / ytdl-options emits must NOT be awaited here: the
@@ -1441,7 +1601,7 @@ async def connect(sid, environ):
     # would delay the handshake past the engine.io ping window. Dispatch them
     # as a background task (strong-referenced, failures logged) so the ACK
     # goes out immediately.
-    bg_tasks.create_task(_emit_connect_finish(sid), name=f"connect_finish_{sid}")
+    bg_tasks.create_task(_emit_connect_finish(sid, user), name=f"connect_finish_{sid}")
 
 _CUSTOM_DIRS_CACHE_TTL_SECONDS = 5
 # (key, time, value) of the last listing; a connect storm reuses it.
@@ -1468,10 +1628,11 @@ def _list_subdirs(base: str) -> list[str]:
     return dirs
 
 
-def get_custom_dirs():
+def get_custom_dirs(cfg=None):
     global _custom_dirs_cache
+    cfg = cfg or config
     now = time.monotonic()
-    key = (config.DOWNLOAD_DIR, config.AUDIO_DOWNLOAD_DIR, config.CUSTOM_DIRS_EXCLUDE_REGEX)
+    key = (cfg.DOWNLOAD_DIR, cfg.AUDIO_DOWNLOAD_DIR, cfg.CUSTOM_DIRS_EXCLUDE_REGEX)
     if (
         _custom_dirs_cache is not None
         and _custom_dirs_cache[0] == key
@@ -1479,10 +1640,10 @@ def get_custom_dirs():
     ):
         return _custom_dirs_cache[2]
 
-    download_dir = _list_subdirs(config.DOWNLOAD_DIR)
+    download_dir = _list_subdirs(cfg.DOWNLOAD_DIR)
     audio_download_dir = download_dir
-    if config.DOWNLOAD_DIR != config.AUDIO_DOWNLOAD_DIR:
-        audio_download_dir = _list_subdirs(config.AUDIO_DOWNLOAD_DIR)
+    if cfg.DOWNLOAD_DIR != cfg.AUDIO_DOWNLOAD_DIR:
+        audio_download_dir = _list_subdirs(cfg.AUDIO_DOWNLOAD_DIR)
 
     result = {
         "download_dir": download_dir,
@@ -1524,8 +1685,33 @@ if config.URL_PREFIX != '/':
     async def index_redirect_dir(request):
         return web.HTTPFound(config.URL_PREFIX)
 
-routes.static(config.URL_PREFIX + 'download/', config.DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
-routes.static(config.URL_PREFIX + 'audio_download/', config.AUDIO_DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
+def _user_file_handler(dir_key):
+    """Serve a finished file to its owner's browser as a regular download.
+
+    The file is looked up under the requesting user's own directory only, so
+    another user's file is a 404 whatever the URL says. Content-Disposition:
+    attachment makes the browser save it (to the user's own Downloads folder)
+    instead of playing it.
+    """
+    async def handler(request):
+        base = os.path.realpath(os.path.join(getattr(config, dir_key), request['metube_user']))
+        target = os.path.realpath(os.path.join(base, request.match_info['path']))
+        if not _is_within_directory(base, target) or _is_within_state_dir(target) or not os.path.isfile(target):
+            raise web.HTTPNotFound()
+        return web.FileResponse(target, headers={
+            'Content-Disposition': "attachment; filename*=UTF-8''" + quote(os.path.basename(target), safe=''),
+            'X-Content-Type-Options': 'nosniff',
+            'Cache-Control': 'private, no-store',
+        })
+    return handler
+
+
+if MULTI_USER:
+    routes.get(config.URL_PREFIX + 'download/{path:.*}')(_user_file_handler('DOWNLOAD_DIR'))
+    routes.get(config.URL_PREFIX + 'audio_download/{path:.*}')(_user_file_handler('AUDIO_DOWNLOAD_DIR'))
+else:
+    routes.static(config.URL_PREFIX + 'download/', config.DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
+    routes.static(config.URL_PREFIX + 'audio_download/', config.AUDIO_DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
 routes.static(config.URL_PREFIX, os.path.join(config.BASE_DIR, 'ui/dist/metube/browser'))
 try:
     app.add_routes(routes)

@@ -97,6 +97,8 @@ Templates use [yt-dlp's output template syntax](https://github.com/yt-dlp/yt-dlp
 | `YTDL_OPTIONS_PRESETS_FILE` | | Path to a JSON file of presets. Reloaded when it changes; wins over `YTDL_OPTIONS_PRESETS` for the same name. |
 | `ALLOW_YTDL_OPTIONS_OVERRIDES` | `false` | Show a field for per-download yt-dlp options in the UI. Trusted users only: it allows running commands in the container. |
 | `YTDL_NIGHTLY_UPDATE_TIME` | | Use [nightly yt-dlp builds](https://github.com/yt-dlp/yt-dlp-nightly-builds), upgrading and restarting daily at this time (`HH:MM`, 24-hour). |
+| `AUTH_USER_HEADER` | | Fork addition. Request header carrying the signed-in account, set by an authenticating reverse proxy (e.g. `Remote-User` with Authelia). When set, every account gets a private queue, history and download folder, and can only fetch its own files. MeTube must then be reachable only through that proxy. |
+| `ADMIN_USER` | | Fork addition. With `AUTH_USER_HEADER`, the one account allowed to manage subscriptions and cookies. |
 
 ### Web server and network
 
