@@ -1,5 +1,4 @@
-# Passerelle MeTube : seule porte d'entrée. Elle demande à Authelia qui est
-# connecté et transmet le compte à MeTube dans l'en-tête Remote-User.
+# Passerelle MeTube : seule porte d'entrée. Elle demande à Authelia qui est connecté et transmet le compte à MeTube dans l'en-tête Remote-User.
 # ${AUTHELIA_URL} est remplacé au démarrage du conteneur (variable de la pile).
 
 resolver 127.0.0.11 valid=10s ipv6=off;          # DNS interne de Docker
