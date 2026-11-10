@@ -39,17 +39,32 @@ jobs:
             exit 0
           fi
 
-          if ! git merge --no-ff --no-commit upstream/master; then
-            echo "::error::Conflit de fusion avec alexta69/metube : résolution manuelle nécessaire."
+          git merge --no-ff --no-commit upstream/master || true
+
+          # Keep the fork's own workflow files: upstream's need upstream's
+          # secrets, and GITHUB_TOKEN may not push changes under
+          # .github/workflows. Conflicts there are settled in the fork's favour.
+          for f in $(git diff --name-only --diff-filter=U -- .github/workflows); do
+            if git cat-file -e "HEAD:$f" 2>/dev/null; then
+              git checkout HEAD -- "$f"
+            else
+              git rm -q --cached -- "$f"; rm -f -- "$f"
+            fi
+          done
+          git diff --cached --name-only -- .github/workflows | while read -r f; do
+            if git cat-file -e "HEAD:$f" 2>/dev/null; then
+              git checkout HEAD -- "$f"
+            else
+              git rm -q --cached -- "$f"; rm -f -- "$f"
+            fi
+          done
+
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "::error::Conflit de fusion avec alexta69/metube, résolution manuelle nécessaire :"
             git diff --name-only --diff-filter=U
             git merge --abort
             exit 1
           fi
-
-          # Keep the fork's own workflow files: upstream's would not run here,
-          # and GITHUB_TOKEN may not push changes under .github/workflows.
-          git checkout HEAD -- .github/workflows
-          git clean -fdq -- .github/workflows
 
           git commit -q -m "Merge alexta69/metube master ($(git rev-parse --short upstream/master))"
           git push origin HEAD:multi-user
