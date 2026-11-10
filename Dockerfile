@@ -98,7 +98,8 @@ ENV PORT=8081
 VOLUME /downloads
 EXPOSE 8081
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD case "$HTTPS" in true|True|on|1) curl -fsSk "https://localhost:${PORT}/";; *) curl -fsS "http://localhost:${PORT}/";; esac || exit 1
+  CMD if [ -n "$AUTH_USER_HEADER" ]; then set -- -H "$AUTH_USER_HEADER: healthcheck"; fi; \
+      case "$HTTPS" in true|True|on|1) curl -fsSk "$@" "https://localhost:${PORT}/";; *) curl -fsS "$@" "http://localhost:${PORT}/";; esac || exit 1
 
 # Add build-time argument for version
 ARG VERSION=dev
