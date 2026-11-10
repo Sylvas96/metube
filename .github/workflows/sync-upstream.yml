@@ -1,0 +1,64 @@
+name: sync-upstream
+
+# Fork-only: merge alexta69/metube master into the multi-user branch every
+# week, then rebuild the image. Upstream publishes a commit for every yt-dlp
+# release, so this also keeps yt-dlp current.
+on:
+  schedule:
+    - cron: '17 7 * * 1'   # lundi, ~2 h du matin à Montréal
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: multi-user
+          fetch-depth: 0
+
+      - name: Merge upstream master
+        id: merge
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/alexta69/metube.git
+          git fetch --no-tags upstream master
+
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "Déjà à jour avec alexta69/metube."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git merge --no-ff --no-commit upstream/master; then
+            echo "::error::Conflit de fusion avec alexta69/metube : résolution manuelle nécessaire."
+            git diff --name-only --diff-filter=U
+            git merge --abort
+            exit 1
+          fi
+
+          # Keep the fork's own workflow files: upstream's would not run here,
+          # and GITHUB_TOKEN may not push changes under .github/workflows.
+          git checkout HEAD -- .github/workflows
+          git clean -fdq -- .github/workflows
+
+          git commit -q -m "Merge alexta69/metube master ($(git rev-parse --short upstream/master))"
+          git push origin HEAD:multi-user
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      # A push made with GITHUB_TOKEN does not start other workflows, but an
+      # explicit dispatch does: test and publish the new image.
+      - name: Rebuild the image
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run fork-image.yml --ref multi-user
