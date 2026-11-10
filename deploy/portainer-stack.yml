@@ -74,7 +74,7 @@ services:
   # MeTube multi-utilisateur : jamais exposé directement.
   metube:
     image: "${METUBE_IMAGE}"
-    container_name: metube
+    container_name: metube-server
     restart: unless-stopped
     environment:
       PUID: "1000"
