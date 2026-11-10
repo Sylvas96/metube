@@ -1556,7 +1556,11 @@ async def _emit_connect_finish(sid, user=None):
     """
     loop = asyncio.get_running_loop()
     if config.CUSTOM_DIRS:
-        dirs = await loop.run_in_executor(None, get_custom_dirs, _config_for_user(user))
+        user_config = _config_for_user(user)
+        if user_config is config:
+            dirs = await loop.run_in_executor(None, get_custom_dirs)
+        else:
+            dirs = await loop.run_in_executor(None, get_custom_dirs, user_config)
         await sio.emit('custom_dirs', serializer.encode(dirs), to=sid)
     if config.YTDL_OPTIONS_FILE:
         options_update = await loop.run_in_executor(None, get_options_update_time)
